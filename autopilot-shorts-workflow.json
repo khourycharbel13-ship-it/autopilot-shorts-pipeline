@@ -1,0 +1,338 @@
+{
+  "name": "Autopilot Shorts Pipeline (n8n + Ollama + Kokoro + Whisper + FFmpeg)",
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "68fce3aa-99e1-4b6c-aa80-28c8ad0cf3d9",
+      "name": "When clicking ‘Execute workflow’",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0a916f6d-a9b2-4d74-a91b-9306e484e44a",
+      "name": "AI Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        460,
+        0
+      ],
+      "parameters": {
+        "promptType": "define",
+        "text": "=Generate a high-converting YouTube Short script about {{ $json.topic }}.\nHARD LIMIT: hook + script_body together must be at most {{ $json.max_words }} words (about 30 seconds spoken). No emojis, no hashtags in spoken text.\nThe pinned_comment_call_to_action must end with this exact link: {{ $json.affiliate_link }}",
+        "options": {
+          "systemMessage": "You are an expert viral tech scriptwriter. Return ONLY a raw JSON object with NO markdown code blocks, no backticks, and no extra text. Use the exact following structure:\n{\n  \"video_title\": \"String\",\n  \"hook\": \"Spoken line under 3 seconds\",\n  \"script_body\": \"Fast-paced spoken content, max 65 words, no emojis\",\n  \"visual_prompts\": [\"Prompt for visual scene 1\", \"Prompt for visual scene 2\", \"Prompt for visual scene 3\"],\n  \"pinned_comment_call_to_action\": \"Affiliate call to action link text\"\n}"
+        }
+      }
+    },
+    {
+      "id": "d817ee36-a6be-42a3-b311-b4db3886129e",
+      "name": "Ollama Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        460,
+        220
+      ],
+      "parameters": {
+        "model": "hermes-agent:latest",
+        "options": {
+          "temperature": 0.8,
+          "numPredict": 700
+        }
+      },
+      "credentials": {
+        "ollamaApi": {
+          "id": "",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "id": "a82db93c-ab97-4662-b6bf-dd847b71d511",
+      "name": "Parse Script JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Robust parser: strips <think> blocks, markdown fences, and any text around the JSON object\nconst raw = String($input.first().json.output ?? $input.first().json.text ?? '');\nlet s = raw.replace(/<think>[\\s\\S]*?<\\/think>/gi, '').replace(/```json|```/gi, '').trim();\nconst start = s.indexOf('{');\nconst end = s.lastIndexOf('}');\nif (start === -1 || end === -1) throw new Error('No JSON object found in model output: ' + raw.slice(0, 300));\nconst data = JSON.parse(s.slice(start, end + 1));\n\n// Spoken voiceover = hook + body; remove characters TTS would read awkwardly\nconst voiceover_text = [data.hook, data.script_body].filter(Boolean).join(' ')\n  .replace(/[\\p{Extended_Pictographic}\\u{FE0F}\\u{200D}\\u{20E3}]/gu, '').replace(/[*_#`]/g, '').replace(/\\s+/g, ' ').trim();\n\n// Base64 so quotes/apostrophes can't break the Windows command line\nconst b64 = (str) => (typeof Buffer !== 'undefined')\n  ? Buffer.from(str, 'utf8').toString('base64')\n  : btoa(unescape(encodeURIComponent(str)));\n\nconst slug = String(data.video_title || 'short').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50);\nconst run_id = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '_' + slug;\n\nreturn [{ json: {\n  ...data,\n  run_id,\n  voiceover_text,\n  voiceover_b64: b64(voiceover_text),\n  data_b64: b64(JSON.stringify({ ...data, voiceover_text }, null, 2)),\n} }];"
+      }
+    },
+    {
+      "id": "e8280f79-1007-4015-94f2-69e0b59c1ad1",
+      "name": "Kokoro TTS Voiceover",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        0
+      ],
+      "parameters": {
+        "executeOnce": true,
+        "command": "=mkdir C:\\n8n-shorts 2>nul & cd /d C:\\n8n-shorts && powershell -NoProfile -Command \"$e=New-Object Text.UTF8Encoding($false); [IO.File]::WriteAllText('C:\\n8n-shorts\\script.txt',$e.GetString([Convert]::FromBase64String('{{ $json.voiceover_b64 }}')),$e); [IO.File]::WriteAllText('C:\\n8n-shorts\\video_data.json',$e.GetString([Convert]::FromBase64String('{{ $json.data_b64 }}')),$e)\" && set PYTHONIOENCODING=utf-8&& kokoro-tts script.txt voiceover.mp3 --voice am_adam --speed 1.15 --format mp3"
+      }
+    },
+    {
+      "id": "b0d7f3f2-e7fe-4a08-8f34-c3686e37b936",
+      "name": "FFmpeg Render Short",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1260,
+        0
+      ],
+      "parameters": {
+        "executeOnce": true,
+        "command": "=cd /d C:\\n8n-shorts && (python -u make_short.py > render.log 2>&1) && (if not exist videos mkdir videos) && (if not exist \"%USERPROFILE%\\.n8n-files\" mkdir \"%USERPROFILE%\\.n8n-files\") && copy /y final_short.mp4 \"%USERPROFILE%\\.n8n-files\\final_short.mp4\" >nul && cd videos && copy /y ..\\final_short.mp4 \"{{ $('Parse Script JSON').item.json.run_id }}.mp4\" >nul && cd .. && type render.log"
+      }
+    },
+    {
+      "id": "a15e170c-fe34-4559-8f8b-03f7ba7284df",
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        0
+      ],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": false,
+        "assignments": {
+          "assignments": [
+            {
+              "id": "c08c27dd-6ec3-407a-b326-2bb89644d3b2",
+              "name": "affiliate_link",
+              "type": "string",
+              "value": "https://your-link-here"
+            },
+            {
+              "id": "d7ba714d-e1ac-4981-81f3-fc43dac7b8f3",
+              "name": "topic",
+              "type": "string",
+              "value": "a crazy AI tool or local automation workflow that saves people 10 hours a week"
+            },
+            {
+              "id": "a9642fbf-8e9c-4978-8bb0-a8fb06d80df6",
+              "name": "max_words",
+              "type": "number",
+              "value": 75
+            },
+            {
+              "id": "ce3ba95e-5432-453f-b99d-53c091822e54",
+              "name": "privacy",
+              "type": "string",
+              "value": "private"
+            },
+            {
+              "id": "937906e2-fdb4-414e-98cd-61632ce7760b",
+              "name": "tags",
+              "type": "string",
+              "value": "shorts,ai,automation,productivity,ai tools"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "f052877a-5b23-4b30-a43c-fee21ed8352a",
+      "name": "Read Final Video",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        1500,
+        0
+      ],
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "C:/Users/user/.n8n-files/final_short.mp4",
+        "options": {}
+      }
+    },
+    {
+      "id": "68a74452-12e4-497d-8e4e-50bbf1798efb",
+      "name": "Upload to YouTube",
+      "type": "n8n-nodes-base.youTube",
+      "typeVersion": 1,
+      "position": [
+        1720,
+        0
+      ],
+      "parameters": {
+        "resource": "video",
+        "operation": "upload",
+        "title": "={{ $('Parse Script JSON').item.json.video_title.slice(0, 90) }} #Shorts",
+        "regionCode": "US",
+        "categoryId": "28",
+        "binaryProperty": "data",
+        "options": {
+          "description": "={{ $('Parse Script JSON').item.json.hook }}\n\n🔗 Link at the top of my channel\n\n#Shorts #AI #Automation",
+          "privacyStatus": "={{ $('Settings').item.json.privacy }}",
+          "tags": "={{ $('Settings').item.json.tags }}",
+          "selfDeclaredMadeForKids": false
+        }
+      },
+      "disabled": true
+    },
+    {
+      "id": "29d3b290-758a-4261-8755-1874b5bbdf88",
+      "name": "Fetch B-roll (Pexels)",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1020,
+        200
+      ],
+      "parameters": {
+        "executeOnce": true,
+        "command": "cd /d C:\\n8n-shorts && set PYTHONIOENCODING=utf-8&& python -u fetch_broll.py --min 15 2>&1"
+      }
+    },
+    {
+      "id": "1a1c056b-85e8-47c4-9526-1d333fb59686",
+      "name": "Daily 6 PM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        -200
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "daysInterval": 1,
+              "triggerAtHour": 18,
+              "triggerAtMinute": 0
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When clicking ‘Execute workflow’": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse Script JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Script JSON": {
+      "main": [
+        [
+          {
+            "node": "Kokoro TTS Voiceover",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kokoro TTS Voiceover": {
+      "main": [
+        [
+          {
+            "node": "Fetch B-roll (Pexels)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "FFmpeg Render Short": {
+      "main": [
+        [
+          {
+            "node": "Read Final Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Final Video": {
+      "main": [
+        [
+          {
+            "node": "Upload to YouTube",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch B-roll (Pexels)": {
+      "main": [
+        [
+          {
+            "node": "FFmpeg Render Short",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily 6 PM": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
